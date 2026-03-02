@@ -1,2 +1,2 @@
 [start]
-cmd = "python airbnb_monitor.py"
+cmd = "python main.py"
