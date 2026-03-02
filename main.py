@@ -23,8 +23,8 @@ from datetime import datetime
 #  ⚙️  CONFIGURACIÓN — edita esto
 # ══════════════════════════════════════════
 
-TELEGRAM_TOKEN = "TU_TOKEN_AQUI"          # De @BotFather
-TELEGRAM_CHAT_ID = "TU_CHAT_ID_AQUI"      # Tu chat_id personal
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")         # De @BotFather
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")      # Tu chat_id personal
 
 CHECK_INTERVAL_MINUTES = 30               # Cada cuántos minutos revisar
 MAX_PRICE_PER_NIGHT = 200                 # Precio máximo por noche (USD)
