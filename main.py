@@ -1,10 +1,14 @@
 """
 🏖️ Airbnb Aruba Monitor - Alertas por Telegram
+Comandos disponibles:
+  /buscar  → busca ahora y te manda los resultados
+  /ayuda   → muestra los comandos disponibles
 """
 
 import requests
 import time
 import os
+import threading
 from datetime import datetime
 
 # ══════════════════════════════════════════
@@ -15,7 +19,7 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CHECK_INTERVAL_MINUTES = 30
-MAX_PRICE_PER_NIGHT    = 130       # USD por noche
+MAX_PRICE_PER_NIGHT    = 130
 MIN_BEDS               = 1
 ENTIRE_HOME_ONLY       = True
 CHECK_IN               = "2025-03-15"
@@ -24,7 +28,6 @@ NIGHTS                 = 10
 ADULTS                 = 2
 CURRENCY               = "USD"
 
-# Criterios para destacar un listing como "confiable"
 HIGHLIGHT_MIN_RATING  = 4.0
 HIGHLIGHT_MIN_REVIEWS = 15
 
@@ -78,7 +81,6 @@ def search_listings():
                     rate = pricing.get("rate", {})
                     price_per_night = float(rate.get("amount", 0)) if rate else 0.0
 
-                    # Detectar pileta en nombre o amenities
                     name = listing.get("name", "")
                     amenities = listing.get("amenities", [])
                     has_pool = any(
@@ -106,13 +108,13 @@ def search_listings():
         return []
 
 # ══════════════════════════════════════════
-#  📱  TELEGRAM
+#  📱  TELEGRAM — enviar
 # ══════════════════════════════════════════
 
-def send_telegram(message):
+def send_telegram(message, chat_id=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -125,48 +127,80 @@ def send_telegram(message):
         print(f"[{now()}] ❌ Error Telegram: {e}")
         return False
 
-def format_listing_message(listing, tag="🆕 NUEVO"):
-    # ¿Es un listing confiable?
-    is_trusted = listing["rating"] >= HIGHLIGHT_MIN_RATING and listing["reviews"] >= HIGHLIGHT_MIN_REVIEWS
+# ══════════════════════════════════════════
+#  📱  TELEGRAM — escuchar comandos
+# ══════════════════════════════════════════
 
-    # Badge principal
-    if is_trusted:
-        header = f"🌟 <b>DESTACADO</b> · {tag}"
-    else:
-        header = tag
+last_update_id = None
 
-    # Calificación
-    if listing["rating"]:
-        rating_line = f"⭐ {listing['rating']:.1f} ({listing['reviews']} reseñas)"
-        if is_trusted:
-            rating_line += " ✅"
-    else:
-        rating_line = "⭐ Sin calificación aún"
+def get_updates():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"timeout": 5, "offset": last_update_id}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("result", [])
+    except:
+        return []
 
-    # Pileta
-    pool_line = "🏊 Tiene pileta" if listing["has_pool"] else ""
+def handle_commands(seen_ids):
+    """Corre en un thread separado, escucha comandos de Telegram."""
+    global last_update_id
+    print(f"[{now()}] 👂 Escuchando comandos...")
 
-    # Precio total
-    total = listing["price_per_night"] * NIGHTS
+    while True:
+        updates = get_updates()
+        for update in updates:
+            last_update_id = update["update_id"] + 1
+            message = update.get("message", {})
+            text = message.get("text", "").strip().lower()
+            chat_id = str(message.get("chat", {}).get("id", ""))
 
-    msg = f"""{header}
+            # Solo responder al chat autorizado
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
 
-🏠 <b>{listing['name']}</b>
+            if text.startswith("/buscar"):
+                print(f"[{now()}] 📲 Comando /buscar recibido")
+                send_telegram("🔍 Buscando ahora mismo, un segundo...", chat_id)
+                listings = search_listings()
+                good = filter_listings(listings)
 
-💰 <b>${listing['price_per_night']:.0f}/noche</b> · ${total:.0f} total ({NIGHTS} noches)
-🛏️ {listing['beds']} camas · {listing['bedrooms']} hab.
-{rating_line}
-{pool_line}
-📅 {CHECK_IN} → {CHECK_OUT}
+                if not good:
+                    send_telegram("😕 No encontré nada disponible bajo los filtros actuales en este momento.", chat_id)
+                else:
+                    trusted = [l for l in good if l["rating"] >= HIGHLIGHT_MIN_RATING and l["reviews"] >= HIGHLIGHT_MIN_REVIEWS]
+                    send_telegram(
+                        f"📊 <b>Resultado de búsqueda</b>\n"
+                        f"Hay <b>{len(good)}</b> opciones bajo ${MAX_PRICE_PER_NIGHT}/noche"
+                        + (f", <b>{len(trusted)}</b> destacadas 🌟" if trusted else "") + ".\n\nTe mando las mejores:",
+                        chat_id
+                    )
+                    sorted_good = sorted(good, key=lambda x: (
+                        -(x["rating"] >= HIGHLIGHT_MIN_RATING and x["reviews"] >= HIGHLIGHT_MIN_REVIEWS),
+                        x["price_per_night"]
+                    ))
+                    for l in sorted_good[:5]:
+                        send_telegram(format_listing_message(l, "🔎 DISPONIBLE"), chat_id)
+                        time.sleep(1)
 
-🔗 <a href="{listing['url']}">Ver en Airbnb</a>""".strip()
+            elif text.startswith("/ayuda") or text.startswith("/start") or text.startswith("/help"):
+                send_telegram(
+                    "🏖️ <b>Comandos disponibles:</b>\n\n"
+                    "/buscar — busca ahora y te manda lo disponible\n"
+                    "/ayuda — muestra este mensaje\n\n"
+                    f"📅 Fechas: {CHECK_IN} → {CHECK_OUT}\n"
+                    f"💰 Máx: ${MAX_PRICE_PER_NIGHT}/noche\n"
+                    f"🌟 Destaca: +{HIGHLIGHT_MIN_RATING}⭐ y +{HIGHLIGHT_MIN_REVIEWS} reseñas\n"
+                    f"⏰ Revisión automática cada {CHECK_INTERVAL_MINUTES} min",
+                    chat_id
+                )
 
-    # Limpiar líneas vacías si no hay pileta
-    msg = "\n".join(line for line in msg.splitlines() if line.strip())
-    return msg
+        time.sleep(2)
 
 # ══════════════════════════════════════════
-#  🔄  FILTROS
+#  🔄  FILTROS Y FORMATO
 # ══════════════════════════════════════════
 
 def now():
@@ -188,6 +222,36 @@ def filter_listings(listings):
         good.append(l)
     return good
 
+def format_listing_message(listing, tag="🆕 NUEVO"):
+    is_trusted = listing["rating"] >= HIGHLIGHT_MIN_RATING and listing["reviews"] >= HIGHLIGHT_MIN_REVIEWS
+
+    header = f"🌟 <b>DESTACADO</b> · {tag}" if is_trusted else tag
+
+    if listing["rating"]:
+        rating_line = f"⭐ {listing['rating']:.1f} ({listing['reviews']} reseñas)"
+        if is_trusted:
+            rating_line += " ✅"
+    else:
+        rating_line = "⭐ Sin calificación aún"
+
+    pool_line = "🏊 Tiene pileta" if listing["has_pool"] else ""
+    total = listing["price_per_night"] * NIGHTS
+
+    msg = f"""{header}
+
+🏠 <b>{listing['name']}</b>
+
+💰 <b>${listing['price_per_night']:.0f}/noche</b> · ${total:.0f} total ({NIGHTS} noches)
+🛏️ {listing['beds']} camas · {listing['bedrooms']} hab.
+{rating_line}
+{pool_line}
+📅 {CHECK_IN} → {CHECK_OUT}
+
+🔗 <a href="{listing['url']}">Ver en Airbnb</a>""".strip()
+
+    msg = "\n".join(line for line in msg.splitlines() if line.strip())
+    return msg
+
 # ══════════════════════════════════════════
 #  🚀  MAIN
 # ══════════════════════════════════════════
@@ -207,14 +271,18 @@ def main():
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """)
 
+    # Arrancar el listener de comandos en un thread separado
+    t = threading.Thread(target=handle_commands, args=(seen_ids,), daemon=True)
+    t.start()
+
     send_telegram(
         f"🏖️ <b>Monitor de Airbnb Aruba activado</b>\n\n"
         f"📅 {CHECK_IN} → {CHECK_OUT}\n"
-        f"🏠 Solo casas/deptos enteros\n"
-        f"💰 Máx: ${MAX_PRICE_PER_NIGHT}/noche · 👥 {ADULTS} personas\n"
-        f"🌟 Te destaco los que tienen +{HIGHLIGHT_MIN_RATING}⭐ y +{HIGHLIGHT_MIN_REVIEWS} reseñas\n"
+        f"🏠 Solo casas/deptos enteros · 👥 {ADULTS} personas\n"
+        f"💰 Máx: ${MAX_PRICE_PER_NIGHT}/noche\n"
+        f"🌟 Destaco los que tienen +{HIGHLIGHT_MIN_RATING}⭐ y +{HIGHLIGHT_MIN_REVIEWS} reseñas\n"
         f"⏰ Revisando cada {CHECK_INTERVAL_MINUTES} minutos\n\n"
-        f"¡Te aviso cuando aparezca algo bueno! 🎯"
+        f"Podés escribirme /buscar en cualquier momento 🎯"
     )
 
     while True:
@@ -233,13 +301,12 @@ def main():
 
             if first_run:
                 if good:
-                    # Ordenar: primero los destacados, luego por precio
                     sorted_good = sorted(good, key=lambda x: (
                         -(x["rating"] >= HIGHLIGHT_MIN_RATING and x["reviews"] >= HIGHLIGHT_MIN_REVIEWS),
                         x["price_per_night"]
                     ))
                     trusted = [l for l in sorted_good if l["rating"] >= HIGHLIGHT_MIN_RATING and l["reviews"] >= HIGHLIGHT_MIN_REVIEWS]
-                    
+
                     send_telegram(
                         f"📊 <b>Primera búsqueda lista</b>\n"
                         f"Encontré <b>{len(good)}</b> opciones bajo ${MAX_PRICE_PER_NIGHT}/noche"
@@ -256,13 +323,12 @@ def main():
 
             elif new_ones:
                 trusted_new = [l for l in new_ones if l["rating"] >= HIGHLIGHT_MIN_RATING and l["reviews"] >= HIGHLIGHT_MIN_REVIEWS]
-                
+
                 if trusted_new:
                     send_telegram(f"🚨🌟 <b>¡{len(new_ones)} nuevo(s) en Aruba, {len(trusted_new)} destacado(s)!</b>")
                 else:
                     send_telegram(f"🚨 <b>¡{len(new_ones)} listing(s) nuevo(s) en Aruba!</b>")
 
-                # Primero los destacados, luego el resto
                 ordered = sorted(new_ones, key=lambda x: (
                     -(x["rating"] >= HIGHLIGHT_MIN_RATING and x["reviews"] >= HIGHLIGHT_MIN_REVIEWS),
                     x["price_per_night"]
